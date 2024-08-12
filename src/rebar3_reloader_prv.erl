@@ -12,8 +12,8 @@
 
 -record(state, {
     time = 500 :: integer(),
-    cmd = "rebar3 compile" :: string(),
-    listen_dirs = [] :: [file:filename()],
+    cmd = "./rebar3 compile" :: string(),
+    extra_apps = [] :: [rebar_app_info:t()],
     valid_extensions = [] :: [binary()],
     last_time :: calendar:datetime(),
     modules = [] :: [module()],
@@ -22,8 +22,12 @@
 
 -include_lib("kernel/include/file.hrl").
 
--define(VALID_EXTENSIONS, [<<".erl">>, <<".hrl">>, <<".src">>, <<".config">>, <<".lock">>,
-    <<".c">>, <<".cpp">>, <<".h">>, <<".hpp">>, <<".cc">>]).
+-define(VALID_EXTENSIONS, [
+    <<".erl">>, <<".hrl">>, <<".src">>, <<".config">>, <<".lock">>,
+    <<".c">>, <<".cpp">>, <<".h">>, <<".hpp">>, <<".cc">>
+]).
+
+-define(DELETE_EXTRA_APPS_BEAM_EXTENSIONS, [<<".erl">>, <<".hrl">>]).
 
 %% ===================================================================
 %% Public API
@@ -78,26 +82,26 @@ reloader_1(RebarState) ->
             timer:sleep(100),
             ?MODULE:reloader_1(RebarState);
         _ ->
-            listen_on_project_apps(RebarState),
+            ExtraApps = listen_on_project_apps(RebarState),
             Time = application:get_env(rebar, reloader_wait_stop_change_time, 500),
-            CMD = application:get_env(rebar, reloader_compile_cmd, "rebar3 compile"),
+            CMD = application:get_env(rebar, reloader_compile_cmd, "./rebar3 compile"),
             ValidExtensions = [Ext || Ext <- application:get_env(rebar, reloader_extra_exts, []), is_binary(Ext)]
                 ++ ?VALID_EXTENSIONS,
             ExclApps = [rebar, erlware_commons, providers, cf, cth_readable]
                 ++ application:get_env(rebar, reloader_excluded_apps, []),
-            ExcludedModules0 = lists:flatten([
-                begin
-                    case application:get_key(ExclApp, modules) of
-                        undefined -> [];
-                        AppModules -> AppModules
-                    end
-                end || ExclApp <- ExclApps]) ++
-                application:get_env(rebar, reloader_excluded_modules, []),
+            ExcludedModules0 =
+                lists:flatten(
+                    [case application:get_key(ExclApp, modules) of
+                         undefined -> [];
+                         AppModules -> AppModules
+                     end || ExclApp <- ExclApps]
+                ) ++ application:get_env(rebar, reloader_excluded_modules, []),
             {Modules, ExcludedModules1} = partition_modules(ExcludedModules0),
             ExcludedModules = lists:usort([M || {M, _} <- ExcludedModules1] ++ ExcludedModules0),
             State = #state{
                 time = Time,
                 cmd = CMD,
+                extra_apps = ExtraApps,
                 valid_extensions = ValidExtensions,
                 last_time = erlang:localtime(),
                 modules = [M || {M, _} <- Modules],
@@ -118,7 +122,7 @@ reloader(State) ->
                     % or we can flush after compile?
                     timer:sleep(200),
                     flush(State#state.time),
-                    compile_and_reload_beam(State)
+                    compile_and_reload_beam(ChangedFile, Ext, State)
             end;
         suspend ->
             ?MODULE:suspend();
@@ -140,40 +144,57 @@ suspend(State) ->
             ?MODULE:suspend(State)
     end.
 
-compile_and_reload_beam(State) ->
+compile_and_reload_beam(ChangedFile, Ext, #state{extra_apps = ExtraApps} = State) ->
+    % 如果改变的文件是 extra_apps 里的 .erl 或 .hrl, 删除对应 ebin 里的 .app
+    [begin
+         ExtraAppOutDir = rebar_app_info:out_dir(AppInfo),
+         case lists:prefix(ExtraAppOutDir, ChangedFile) andalso lists:member(Ext, ?DELETE_EXTRA_APPS_BEAM_EXTENSIONS) of
+             true ->    % 是 extra_apps 里的文件, 且是要删除 extra.app 文件的后缀
+                 ExtraAppName = erlang:binary_to_list(rebar_app_info:name(AppInfo)),
+                 ExtraDotAppPath = filename:join([ExtraAppOutDir, "ebin", ExtraAppName ++ ".app"]),
+                 filelib:is_file(ExtraDotAppPath) andalso file:delete(ExtraDotAppPath);
+             _ ->
+                 skip
+         end
+     end || AppInfo <- ExtraApps],
+    % 执行编译操作
+    rebar_api:info("Reloader recompiling...", []),
     io:format(os:cmd(State#state.cmd)),
     Now = erlang:localtime(),
     ExcludedModules0 = State#state.excluded_modules,
     {Modules0, ExcludedModules1} = partition_modules(ExcludedModules0),
     OldMods = State#state.modules,
-    {NeedModules, _NewAddModules} = lists:partition(
-        fun({M, _File}) ->
-            lists:member(M, OldMods) orelse lists:member(M, ExcludedModules0)
-        end, Modules0),
+    {NeedModules, _NewAddModules} =
+        lists:partition(
+            fun({M, _File}) ->
+                lists:member(M, OldMods) orelse lists:member(M, ExcludedModules0)
+            end, Modules0),
     reload_modules(NeedModules, State#state.last_time),
 
     Modules = lists:usort([M || {M, _} <- Modules0] ++ OldMods),
     ExcludedModules = lists:usort([M || {M, _} <- ExcludedModules1] ++ ExcludedModules0),
     flush(State#state.time),
-    ?MODULE:reloader(State#state{
-        last_time = Now, modules = Modules, excluded_modules = ExcludedModules}).
+    ?MODULE:reloader(State#state{last_time = Now, modules = Modules, excluded_modules = ExcludedModules}).
 
 listen_on_project_apps(State) ->
     CheckoutDeps = [AppInfo ||
         AppInfo <- rebar_state:all_deps(State),
         rebar_app_info:is_checkout(AppInfo) == true
     ],
+    ExtraApps = [AppInfo || AppInfo <- rebar_state:all_deps(State),
+        lists:member(binary_to_atom(rebar_app_info:name(AppInfo)), application:get_env(rebar, reloader_extra_apps, []))],
     ProjectApps = rebar_state:project_apps(State),
-    AppDirs = [rebar_app_info:dir(AppInfo) || AppInfo <- ProjectApps ++ CheckoutDeps],
-    Dirs = lists:usort(["src", "c_src" |
-        [Dir || Dir <- application:get_env(rebar, reloader_extra_dirs, []), is_list(Dir)]]),
+    AppDirs = [rebar_app_info:dir(AppInfo) || AppInfo <- ProjectApps ++ CheckoutDeps ++ ExtraApps],
+    ExtraDirs = [Dir || Dir <- application:get_env(rebar, reloader_extra_dirs, []), is_list(Dir)],
+    Dirs = lists:usort(["src", "c_src", "include" | ExtraDirs]),
     [begin
          NewDir = filename:join(AppDir, Dir),
          case filelib:is_dir(NewDir) of
              true -> enotify:start_link(NewDir);
              false -> ignore
          end
-     end || AppDir <- AppDirs, Dir <- Dirs].
+     end || AppDir <- AppDirs, Dir <- Dirs],
+    ExtraApps.
 
 partition_modules(ExcludedModules0) ->
     LibDir = code:lib_dir(),
@@ -212,18 +233,19 @@ reload_modules_do(Modules, true) ->
             [code:purge(M) || M <- Modules],
             code:finish_loading(Prepared);
         {error, ModRsns} ->
-            Blacklist = lists:foldr(
-                fun({ModError, Error}, Acc) ->
-                    case Error of
-                        % perhaps cover other cases of failure?
-                        on_load_not_allowed ->
-                            reload_modules([ModError], false),
-                            [ModError | Acc];
-                        _ ->
-                            rebar_api:debug("Module ~p failed to atomic load because ~p", [ModError, Error]),
-                            [ModError | Acc]
-                    end
-                end, [], ModRsns),
+            Blacklist =
+                lists:foldr(
+                    fun({ModError, Error}, Acc) ->
+                        case Error of
+                            % perhaps cover other cases of failure?
+                            on_load_not_allowed ->
+                                reload_modules([ModError], false),
+                                [ModError | Acc];
+                            _ ->
+                                rebar_api:debug("Module ~p failed to atomic load because ~p", [ModError, Error]),
+                                [ModError | Acc]
+                        end
+                    end, [], ModRsns),
             reload_modules(Modules -- Blacklist, true)
     end;
 reload_modules_do(Modules, false) ->

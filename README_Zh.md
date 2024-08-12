@@ -26,8 +26,18 @@ rebar3_reloader
 
 ```erlang
 {plugins, [
-    {rebar3_reloader, "0.1.0"}
+    {rebar3_reloader, {git, "https://github.com/Gelomen/rebar3_reloader.git", {branch, "master"}}}
 ]}.
+```
+
+监控额外的应用, 将配置添加近 `dev_sys.config`, 例如, 监控 `cowboy` 和 `eetcd`
+
+```erlang
+[
+    {rebar, [
+        {reloader_extra_apps, [cowboy, eetcd]}
+    ]}
+].
 ```
 
 只需要在你的应用下调用 `rebar3 reloader`:

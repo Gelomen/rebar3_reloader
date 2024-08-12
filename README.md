@@ -28,8 +28,18 @@ Add the plugin to your `rebar.config` or your global config `~/.config/rebar3/re
 
 ```erlang
 {plugins, [
-    {rebar3_reloader, "0.1.0"}
+    {rebar3_reloader, {git, "https://github.com/Gelomen/rebar3_reloader.git", {branch, "master"}}}
 ]}.
+```
+
+Monitoring extra app, add config to `dev_sys.config`, for example, monitoring `cowboy` and `eetcd`:
+
+```erlang
+[
+    {rebar, [
+        {reloader_extra_apps, [cowboy, eetcd]}
+    ]}
+].
 ```
 
 Then just call `rebar3 reloader` directly in an existing application:
